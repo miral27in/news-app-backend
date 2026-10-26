@@ -36,15 +36,16 @@ export interface AgentResult {
 	finished_at: string;
 }
 
-export async function runAgent(env: Env): Promise<AgentResult> {
+export async function runAgent(env: Env, onlyTopic?: string): Promise<AgentResult> {
 	const startedAt = new Date().toISOString();
 	const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 
 	// Topics are independent, so search them concurrently; one failing topic doesn't sink the run.
+	const selected = onlyTopic ? TOPICS.filter((t) => t.id === onlyTopic) : TOPICS;
 	const topics = await Promise.all(
-		TOPICS.map(async (topic): Promise<TopicResult> => {
+		selected.map(async (topic): Promise<TopicResult> => {
 			try {
-				const candidates = await findArticles(client, topic);
+				const candidates = await findArticlesWithRetry(client, topic);
 				return await storeArticles(env.DB, topic.id, candidates);
 			} catch (err) {
 				console.error(`agent: topic ${topic.id} failed`, err);
@@ -74,6 +75,17 @@ export async function runAgent(env: Env): Promise<AgentResult> {
 		started_at: startedAt,
 		finished_at: new Date().toISOString(),
 	};
+}
+
+/** Claude occasionally answers in prose (e.g. a search tool hiccup) instead of the JSON list; one retry usually fixes it. */
+async function findArticlesWithRetry(client: Anthropic, topic: Topic) {
+	try {
+		return await findArticles(client, topic);
+	} catch (err) {
+		if (!(err instanceof Error) || !err.message.startsWith("No JSON array")) throw err;
+		console.warn(`agent: topic ${topic.id} returned no JSON list, retrying once`);
+		return await findArticles(client, topic);
+	}
 }
 
 async function findArticles(client: Anthropic, topic: Topic): Promise<{ raw: unknown[]; valid: CandidateArticle[] }> {

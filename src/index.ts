@@ -9,6 +9,7 @@
  */
 import { runAgent } from "./agent";
 import { BadRequestError, listArticles } from "./articles";
+import { TOPICS } from "./topics";
 
 const CORS_HEADERS = {
 	"Access-Control-Allow-Origin": "*",
@@ -74,6 +75,12 @@ export default {
 				const caller = callerKind(request, env);
 				if (caller === "denied") return json({ error: "Unauthorized" }, 401);
 
+				// Optional ?topic=<id> reruns a single topic (e.g. after one of three failed).
+				const topic = searchParams.get("topic");
+				if (topic && !TOPICS.some((t) => t.id === topic)) {
+					return json({ error: `Unknown topic. Use one of: ${TOPICS.map((t) => t.id).join(", ")}` }, 400);
+				}
+
 				const now = Date.now();
 				if (caller === "public") {
 					const wait = await publicCooldownRemaining(env.DB, now);
@@ -87,7 +94,7 @@ export default {
 				await env.DB.prepare("INSERT INTO agent_runs (started_at, trigger) VALUES (?, ?)")
 					.bind(new Date(now).toISOString(), caller === "key" ? "api_key" : "public")
 					.run();
-				return json(await runAgent(env));
+				return json(await runAgent(env, topic ?? undefined));
 			}
 
 			if (path === "/articles" && request.method === "GET") {
