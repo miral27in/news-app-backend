@@ -2,7 +2,7 @@
  * News Intelligence App backend.
  *
  *   GET  /health    service status + timestamp
- *   POST /agent     run the news pipeline (also GET); requires AGENT_KEY when that secret is set
+ *   POST /agent     run the news pipeline (also GET); AGENT_KEY bypasses the 15-minute limit on keyless calls
  *   GET  /articles  stored articles, filterable (see src/articles.ts)
  *
  * The pipeline also runs daily at 7 AM US Eastern via the cron triggers in wrangler.jsonc.
@@ -27,11 +27,23 @@ function json(body: unknown, status = 200): Response {
 	});
 }
 
-function isAuthorized(request: Request, env: Env): boolean {
-	if (!env.AGENT_KEY) return true;
+// Keyless callers (the public dashboard's Refresh button) may start a run at most this often.
+const PUBLIC_RUN_COOLDOWN_MS = 15 * 60 * 1000;
+
+/** "key" = valid AGENT_KEY, "public" = no key supplied, "denied" = a key was supplied but is wrong. */
+function callerKind(request: Request, env: Env): "key" | "public" | "denied" {
 	const header = request.headers.get("Authorization") ?? "";
 	const key = header.startsWith("Bearer ") ? header.slice(7) : new URL(request.url).searchParams.get("key");
-	return key === env.AGENT_KEY;
+	if (!key) return "public";
+	return env.AGENT_KEY && key === env.AGENT_KEY ? "key" : "denied";
+}
+
+/** Seconds until a keyless caller may start another run, or 0 if allowed now. */
+async function publicCooldownRemaining(db: D1Database, now: number): Promise<number> {
+	const last = await db.prepare("SELECT MAX(started_at) AS started_at FROM agent_runs").first<{ started_at: string | null }>();
+	if (!last?.started_at) return 0;
+	const elapsed = now - Date.parse(last.started_at);
+	return Math.max(0, Math.ceil((PUBLIC_RUN_COOLDOWN_MS - elapsed) / 1000));
 }
 
 /** Hour of day in the schedule's time zone, so the 7 AM run survives daylight-saving changes. */
@@ -59,7 +71,22 @@ export default {
 			}
 
 			if (path === "/agent" && (request.method === "POST" || request.method === "GET")) {
-				if (!isAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
+				const caller = callerKind(request, env);
+				if (caller === "denied") return json({ error: "Unauthorized" }, 401);
+
+				const now = Date.now();
+				if (caller === "public") {
+					const wait = await publicCooldownRemaining(env.DB, now);
+					if (wait > 0) {
+						return json(
+							{ error: "A refresh ran recently. Please try again later.", retry_after_seconds: wait },
+							429,
+						);
+					}
+				}
+				await env.DB.prepare("INSERT INTO agent_runs (started_at, trigger) VALUES (?, ?)")
+					.bind(new Date(now).toISOString(), caller === "key" ? "api_key" : "public")
+					.run();
 				return json(await runAgent(env));
 			}
 

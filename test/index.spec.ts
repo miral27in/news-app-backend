@@ -1,4 +1,4 @@
-import { SELF } from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { extractJsonArray, normalizeArticle } from "../src/agent";
 
@@ -18,9 +18,23 @@ describe("HTTP endpoints", () => {
 		expect(response.headers.get("Access-Control-Allow-Methods")).toContain("GET");
 	});
 
-	it("rejects /agent without the agent key", async () => {
-		const response = await SELF.fetch("https://example.com/agent", { method: "POST" });
+	it("rejects /agent with a wrong agent key", async () => {
+		const response = await SELF.fetch("https://example.com/agent", {
+			method: "POST",
+			headers: { Authorization: "Bearer not-the-key" },
+		});
 		expect(response.status).toBe(401);
+	});
+
+	it("rate-limits keyless /agent calls after a recent run", async () => {
+		await env.DB.exec("CREATE TABLE IF NOT EXISTS agent_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, trigger TEXT NOT NULL)");
+		await env.DB.prepare("INSERT INTO agent_runs (started_at, trigger) VALUES (?, 'public')").bind(new Date().toISOString()).run();
+
+		const response = await SELF.fetch("https://example.com/agent", { method: "POST" });
+		expect(response.status).toBe(429);
+		expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+		const body = await response.json<{ retry_after_seconds: number }>();
+		expect(body.retry_after_seconds).toBeGreaterThan(0);
 	});
 
 	it("validates /articles filters", async () => {

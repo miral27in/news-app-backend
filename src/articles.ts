@@ -23,6 +23,7 @@ export interface ArticleRow {
  *   source     publication name, case-insensitive exact match
  *   min_score  minimum relevance score, 1-10
  *   limit      max rows, default 50, max 200
+ * The response also carries last_refreshed: when the newest article (any topic) was fetched.
  */
 export async function listArticles(db: D1Database, params: URLSearchParams) {
 	const where: string[] = [];
@@ -82,5 +83,6 @@ export async function listArticles(db: D1Database, params: URLSearchParams) {
 		.bind(...binds, limit)
 		.all<ArticleRow>();
 
-	return { count: results.length, articles: results };
+	const latest = await db.prepare("SELECT MAX(fetched_at) AS fetched_at FROM articles").first<{ fetched_at: string | null }>();
+	return { count: results.length, last_refreshed: latest?.fetched_at ?? null, articles: results };
 }
