@@ -1,9 +1,9 @@
 /**
  * News Intelligence App backend.
  *
- *   GET  /health    service status + timestamp
- *   POST /agent     run the news pipeline (also GET); AGENT_KEY bypasses the 15-minute limit on keyless calls
- *   GET  /articles  stored articles, filterable (see src/articles.ts)
+ *   GET  /health    service status + timestamp (public)
+ *   POST /agent     run the news pipeline; requires "Authorization: Bearer <AGENT_KEY>" (401 otherwise)
+ *   GET  /articles  stored articles, filterable (public; see src/articles.ts)
  *
  * The pipeline also runs daily at 7 AM US Eastern via the cron triggers in wrangler.jsonc.
  */
@@ -28,23 +28,42 @@ function json(body: unknown, status = 200): Response {
 	});
 }
 
-// Keyless callers (the public dashboard's Refresh button) may start a run at most this often.
-const PUBLIC_RUN_COOLDOWN_MS = 15 * 60 * 1000;
+// The dashboard's Refresh button reaches /agent through a Pages function that holds the password, so
+// anyone who opens the dashboard can trigger a run. Those calls (marked with X-Agent-Source: dashboard)
+// are therefore limited to one run per this interval, which caps the credits a visitor can spend.
+const DASHBOARD_RUN_COOLDOWN_MS = 15 * 60 * 1000;
+const DASHBOARD_SOURCE = "dashboard";
 
-/** "key" = valid AGENT_KEY, "public" = no key supplied, "denied" = a key was supplied but is wrong. */
-function callerKind(request: Request, env: Env): "key" | "public" | "denied" {
-	const header = request.headers.get("Authorization") ?? "";
-	const key = header.startsWith("Bearer ") ? header.slice(7) : new URL(request.url).searchParams.get("key");
-	if (!key) return "public";
-	return env.AGENT_KEY && key === env.AGENT_KEY ? "key" : "denied";
+/** Constant-time password check: compares SHA-256 digests so the comparison time doesn't leak a prefix match. */
+async function passwordMatches(supplied: string, expected: string): Promise<boolean> {
+	const enc = new TextEncoder();
+	const [a, b] = await Promise.all([
+		crypto.subtle.digest("SHA-256", enc.encode(supplied)),
+		crypto.subtle.digest("SHA-256", enc.encode(expected)),
+	]);
+	return crypto.subtle.timingSafeEqual(a, b);
 }
 
-/** Seconds until a keyless caller may start another run, or 0 if allowed now. */
-async function publicCooldownRemaining(db: D1Database, now: number): Promise<number> {
-	const last = await db.prepare("SELECT MAX(started_at) AS started_at FROM agent_runs").first<{ started_at: string | null }>();
+/**
+ * Checks the AGENT_KEY password, which must arrive as "Authorization: Bearer <password>" (never in the URL,
+ * where it would be logged). Fails closed: if the secret isn't configured, nobody gets in.
+ */
+async function checkAgentAuth(request: Request, env: Env): Promise<"ok" | "missing" | "wrong" | "unconfigured"> {
+	if (!env.AGENT_KEY) return "unconfigured";
+	const header = request.headers.get("Authorization") ?? "";
+	if (!header.startsWith("Bearer ") || header.length <= 7) return "missing";
+	return (await passwordMatches(header.slice(7), env.AGENT_KEY)) ? "ok" : "wrong";
+}
+
+/** Seconds until the dashboard may start another run, or 0 if allowed now. */
+async function dashboardCooldownRemaining(db: D1Database, now: number): Promise<number> {
+	const last = await db
+		.prepare("SELECT MAX(started_at) AS started_at FROM agent_runs WHERE trigger = ?")
+		.bind(DASHBOARD_SOURCE)
+		.first<{ started_at: string | null }>();
 	if (!last?.started_at) return 0;
 	const elapsed = now - Date.parse(last.started_at);
-	return Math.max(0, Math.ceil((PUBLIC_RUN_COOLDOWN_MS - elapsed) / 1000));
+	return Math.max(0, Math.ceil((DASHBOARD_RUN_COOLDOWN_MS - elapsed) / 1000));
 }
 
 /** Hour of day in the schedule's time zone, so the 7 AM run survives daylight-saving changes. */
@@ -71,9 +90,32 @@ export default {
 				return json({ status: "ok", service: "news-app-backend", timestamp: new Date().toISOString() });
 			}
 
-			if (path === "/agent" && (request.method === "POST" || request.method === "GET")) {
-				const caller = callerKind(request, env);
-				if (caller === "denied") return json({ error: "Unauthorized" }, 401);
+			if (path === "/agent") {
+				if (request.method !== "POST") {
+					return new Response(JSON.stringify({ error: "Use POST" }), {
+						status: 405,
+						headers: { "Content-Type": "application/json; charset=utf-8", Allow: "POST, OPTIONS", ...CORS_HEADERS },
+					});
+				}
+
+				const auth = await checkAgentAuth(request, env);
+				if (auth === "unconfigured") {
+					console.error("AGENT_KEY secret is not set; refusing to run the pipeline");
+					return json({ error: "Pipeline endpoint is not configured" }, 503);
+				}
+				if (auth !== "ok") {
+					return new Response(
+						JSON.stringify({ error: auth === "missing" ? "Unauthorized: a password is required" : "Unauthorized: wrong password" }),
+						{
+							status: 401,
+							headers: {
+								"Content-Type": "application/json; charset=utf-8",
+								"WWW-Authenticate": 'Bearer realm="news-pipeline"',
+								...CORS_HEADERS,
+							},
+						},
+					);
+				}
 
 				// Optional ?topic=<id> reruns a single topic (e.g. after one of three failed).
 				const topic = searchParams.get("topic");
@@ -82,8 +124,9 @@ export default {
 				}
 
 				const now = Date.now();
-				if (caller === "public") {
-					const wait = await publicCooldownRemaining(env.DB, now);
+				const fromDashboard = request.headers.get("X-Agent-Source") === DASHBOARD_SOURCE;
+				if (fromDashboard) {
+					const wait = await dashboardCooldownRemaining(env.DB, now);
 					if (wait > 0) {
 						return json(
 							{ error: "A refresh ran recently. Please try again later.", retry_after_seconds: wait },
@@ -92,7 +135,7 @@ export default {
 					}
 				}
 				await env.DB.prepare("INSERT INTO agent_runs (started_at, trigger) VALUES (?, ?)")
-					.bind(new Date(now).toISOString(), caller === "key" ? "api_key" : "public")
+					.bind(new Date(now).toISOString(), fromDashboard ? DASHBOARD_SOURCE : "api_key")
 					.run();
 				return json(await runAgent(env, topic ?? undefined));
 			}

@@ -18,21 +18,42 @@ describe("HTTP endpoints", () => {
 		expect(response.headers.get("Access-Control-Allow-Methods")).toContain("GET");
 	});
 
-	it("rejects /agent with a wrong agent key", async () => {
+	it("rejects /agent with no password", async () => {
+		const response = await SELF.fetch("https://example.com/agent", { method: "POST" });
+		expect(response.status).toBe(401);
+		expect(response.headers.get("WWW-Authenticate")).toContain("Bearer");
+		expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+	});
+
+	it("rejects /agent with a wrong password", async () => {
 		const response = await SELF.fetch("https://example.com/agent", {
 			method: "POST",
-			headers: { Authorization: "Bearer not-the-key" },
+			headers: { Authorization: "Bearer not-the-password" },
 		});
 		expect(response.status).toBe(401);
 	});
 
-	it("rate-limits keyless /agent calls after a recent run", async () => {
-		await env.DB.exec("CREATE TABLE IF NOT EXISTS agent_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, trigger TEXT NOT NULL)");
-		await env.DB.prepare("INSERT INTO agent_runs (started_at, trigger) VALUES (?, 'public')").bind(new Date().toISOString()).run();
+	it("does not accept the password in the URL", async () => {
+		const response = await SELF.fetch(`https://example.com/agent?key=${env.AGENT_KEY}`, { method: "POST" });
+		expect(response.status).toBe(401);
+	});
 
-		const response = await SELF.fetch("https://example.com/agent", { method: "POST" });
+	it("only allows POST on /agent", async () => {
+		const response = await SELF.fetch("https://example.com/agent", { method: "GET" });
+		expect(response.status).toBe(405);
+		expect(response.headers.get("Allow")).toContain("POST");
+	});
+
+	it("accepts the correct password, then rate-limits dashboard calls after a recent run", async () => {
+		await env.DB.exec("CREATE TABLE IF NOT EXISTS agent_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, trigger TEXT NOT NULL)");
+		await env.DB.prepare("INSERT INTO agent_runs (started_at, trigger) VALUES (?, 'dashboard')").bind(new Date().toISOString()).run();
+
+		// A 429 (rather than 401) proves the password was accepted; it also avoids starting a real pipeline run.
+		const response = await SELF.fetch("https://example.com/agent", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${env.AGENT_KEY}`, "X-Agent-Source": "dashboard" },
+		});
 		expect(response.status).toBe(429);
-		expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
 		const body = await response.json<{ retry_after_seconds: number }>();
 		expect(body.retry_after_seconds).toBeGreaterThan(0);
 	});

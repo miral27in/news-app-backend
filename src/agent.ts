@@ -105,6 +105,7 @@ Respond with only a JSON array of ${ARTICLES_PER_RUN} objects, no prose and no c
 	const messages: Anthropic.Beta.BetaMessageParam[] = [{ role: "user", content: prompt }];
 	let response: Anthropic.Beta.BetaMessage | undefined;
 	const textParts: string[] = [];
+	const searchErrors: string[] = [];
 
 	for (let i = 0; i <= MAX_CONTINUATIONS; i++) {
 		response = await client.beta.messages.create({
@@ -120,6 +121,10 @@ Respond with only a JSON array of ${ARTICLES_PER_RUN} objects, no prose and no c
 		// Web search splits the answer into many text blocks (one per citation span); keep them all.
 		for (const block of response.content) {
 			if (block.type === "text") textParts.push(block.text);
+			// A failed search comes back as a 200 with an error object (not a list of results) in its result block.
+			if (block.type === "web_search_tool_result" && !Array.isArray(block.content)) {
+				searchErrors.push(block.content.error_code);
+			}
 		}
 
 		// pause_turn: the server paused a long tool-use turn; send the content back to resume it.
@@ -134,7 +139,15 @@ Respond with only a JSON array of ${ARTICLES_PER_RUN} objects, no prose and no c
 		throw new Error(`Search did not finish after ${MAX_CONTINUATIONS} continuations`);
 	}
 
-	const raw = extractJsonArray(textParts.join(""));
+	if (searchErrors.length) console.warn(`agent: topic ${topic.id} web_search errors: ${searchErrors.join(", ")}`);
+	let raw: unknown[];
+	try {
+		raw = extractJsonArray(textParts.join(""));
+	} catch (err) {
+		// Keep the message prefix ("No JSON array") that findArticlesWithRetry matches on; add the real cause.
+		if (err instanceof Error && searchErrors.length) err.message += ` [web_search errors: ${searchErrors.join(", ")}]`;
+		throw err;
+	}
 	const valid = raw.map(normalizeArticle).filter((a): a is CandidateArticle => a !== null);
 	return { raw, valid };
 }

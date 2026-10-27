@@ -222,10 +222,13 @@
 		showBanner("info", "Searching the web for new articles. This usually takes one to three minutes.");
 
 		try {
-			const res = await fetch(`${API}/agent`, { method: "POST" });
+			// Same-origin proxy: the Pages function adds the pipeline password server-side.
+			const res = await fetch("/api/refresh", { method: "POST" });
 			const data = await res.json().catch(() => ({}));
 
-			if (res.status === 429) {
+			if (res.status === 401 || res.status === 503) {
+				showBanner("error", "Refresh isn't available right now. Please try again later.");
+			} else if (res.status === 429) {
 				const mins = Math.max(1, Math.ceil((data.retry_after_seconds || 60) / 60));
 				showBanner("info", `The news was refreshed recently. You can run another refresh in about ${mins} minute${mins === 1 ? "" : "s"}.`);
 			} else if (!res.ok) {
