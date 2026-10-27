@@ -3,57 +3,25 @@
  *
  *   GET  /health    service status + timestamp (public)
  *   POST /agent     run the news pipeline; requires "Authorization: Bearer <AGENT_KEY>" (401 otherwise)
+ *   POST /chat      answer a question from the most relevant recent articles; same password as /agent
  *   GET  /articles  stored articles, filterable (public; see src/articles.ts)
  *
  * The pipeline also runs daily at 7 AM US Eastern via the cron triggers in wrangler.jsonc.
  */
 import { runAgent } from "./agent";
 import { BadRequestError, listArticles } from "./articles";
+import { handleChat } from "./chat";
+import { CORS_HEADERS, json, methodNotAllowed, requirePassword } from "./http";
 import { TOPICS } from "./topics";
-
-const CORS_HEADERS = {
-	"Access-Control-Allow-Origin": "*",
-	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-	"Access-Control-Allow-Headers": "Content-Type, Authorization",
-	"Access-Control-Max-Age": "86400",
-};
 
 const SCHEDULE_TIME_ZONE = "America/New_York";
 const SCHEDULE_HOUR = 7;
-
-function json(body: unknown, status = 200): Response {
-	return new Response(JSON.stringify(body, null, 2), {
-		status,
-		headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS },
-	});
-}
 
 // The dashboard's Refresh button reaches /agent through a Pages function that holds the password, so
 // anyone who opens the dashboard can trigger a run. Those calls (marked with X-Agent-Source: dashboard)
 // are therefore limited to one run per this interval, which caps the credits a visitor can spend.
 const DASHBOARD_RUN_COOLDOWN_MS = 15 * 60 * 1000;
 const DASHBOARD_SOURCE = "dashboard";
-
-/** Constant-time password check: compares SHA-256 digests so the comparison time doesn't leak a prefix match. */
-async function passwordMatches(supplied: string, expected: string): Promise<boolean> {
-	const enc = new TextEncoder();
-	const [a, b] = await Promise.all([
-		crypto.subtle.digest("SHA-256", enc.encode(supplied)),
-		crypto.subtle.digest("SHA-256", enc.encode(expected)),
-	]);
-	return crypto.subtle.timingSafeEqual(a, b);
-}
-
-/**
- * Checks the AGENT_KEY password, which must arrive as "Authorization: Bearer <password>" (never in the URL,
- * where it would be logged). Fails closed: if the secret isn't configured, nobody gets in.
- */
-async function checkAgentAuth(request: Request, env: Env): Promise<"ok" | "missing" | "wrong" | "unconfigured"> {
-	if (!env.AGENT_KEY) return "unconfigured";
-	const header = request.headers.get("Authorization") ?? "";
-	if (!header.startsWith("Bearer ") || header.length <= 7) return "missing";
-	return (await passwordMatches(header.slice(7), env.AGENT_KEY)) ? "ok" : "wrong";
-}
 
 /** Seconds until the dashboard may start another run, or 0 if allowed now. */
 async function dashboardCooldownRemaining(db: D1Database, now: number): Promise<number> {
@@ -91,31 +59,9 @@ export default {
 			}
 
 			if (path === "/agent") {
-				if (request.method !== "POST") {
-					return new Response(JSON.stringify({ error: "Use POST" }), {
-						status: 405,
-						headers: { "Content-Type": "application/json; charset=utf-8", Allow: "POST, OPTIONS", ...CORS_HEADERS },
-					});
-				}
-
-				const auth = await checkAgentAuth(request, env);
-				if (auth === "unconfigured") {
-					console.error("AGENT_KEY secret is not set; refusing to run the pipeline");
-					return json({ error: "Pipeline endpoint is not configured" }, 503);
-				}
-				if (auth !== "ok") {
-					return new Response(
-						JSON.stringify({ error: auth === "missing" ? "Unauthorized: a password is required" : "Unauthorized: wrong password" }),
-						{
-							status: 401,
-							headers: {
-								"Content-Type": "application/json; charset=utf-8",
-								"WWW-Authenticate": 'Bearer realm="news-pipeline"',
-								...CORS_HEADERS,
-							},
-						},
-					);
-				}
+				if (request.method !== "POST") return methodNotAllowed("POST");
+				const denied = await requirePassword(request, env);
+				if (denied) return denied;
 
 				// Optional ?topic=<id> reruns a single topic (e.g. after one of three failed).
 				const topic = searchParams.get("topic");
@@ -140,11 +86,23 @@ export default {
 				return json(await runAgent(env, topic ?? undefined));
 			}
 
+			if (path === "/chat") {
+				if (request.method !== "POST") return methodNotAllowed("POST");
+				const denied = await requirePassword(request, env);
+				if (denied) return denied;
+				// The dashboard's Pages proxy marks its calls and forwards the visitor's IP for per-visitor limits.
+				const fromDashboard = request.headers.get("X-Agent-Source") === DASHBOARD_SOURCE;
+				return await handleChat(request, env, {
+					fromDashboard,
+					clientIp: fromDashboard ? (request.headers.get("X-Client-IP") ?? undefined) : undefined,
+				});
+			}
+
 			if (path === "/articles" && request.method === "GET") {
 				return json(await listArticles(env.DB, searchParams));
 			}
 
-			return json({ error: "Not found", endpoints: ["/health", "/agent", "/articles"] }, 404);
+			return json({ error: "Not found", endpoints: ["/health", "/agent", "/chat", "/articles"] }, 404);
 		} catch (err) {
 			if (err instanceof BadRequestError) return json({ error: err.message }, 400);
 			console.error("request failed", err);

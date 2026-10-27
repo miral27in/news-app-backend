@@ -26,6 +26,44 @@
 	</header>
 
 	<main class="wrap">
+		<section class="chat" aria-labelledby="chat-title">
+			<details open>
+				<summary id="chat-title">Ask the news analyst</summary>
+				<div class="chat-body">
+					<div class="chat-settings">
+						<label class="chat-system">
+							<span>System prompt</span>
+							<textarea id="chat-system" rows="4" maxlength="4000" spellcheck="false"></textarea>
+						</label>
+						<div class="chat-side">
+							<label>
+								<span>Model</span>
+								<select id="chat-model">
+									<option value="claude-haiku-5-5">Fast: Claude Haiku 5.5</option>
+									<option value="claude-opus-5-5">Capable: Claude Opus 5.5</option>
+								</select>
+							</label>
+							<button type="button" id="chat-reset" class="btn-link">Reset prompt</button>
+						</div>
+					</div>
+
+					<div id="chat-log" class="chat-log" role="log" aria-live="polite" aria-label="Conversation" tabindex="0">
+						<p class="chat-empty">Ask about the latest NFL, stock market or weather news. Answers come from the articles below.</p>
+					</div>
+
+					<form id="chat-form" class="chat-form">
+						<label class="sr-only" for="chat-input">Your question</label>
+						<textarea id="chat-input" rows="2" maxlength="2000" placeholder="e.g. What's the latest on the Ravens' injuries?"></textarea>
+						<button id="chat-send" class="btn-primary" type="submit">
+							<span class="spinner" aria-hidden="true"></span>
+							<span id="chat-send-label">Send</span>
+						</button>
+					</form>
+					<p class="chat-note">Each question is answered from the latest stored articles; earlier messages aren't remembered.</p>
+				</div>
+			</details>
+		</section>
+
 		<form id="filters" class="filters" aria-label="Filter articles">
 			<label>
 				<span>Topic</span>
@@ -67,5 +105,6 @@
 
 	<script src="config.js"></script>
 	<script src="app.js"></script>
+	<script src="chat.js"></script>
 </body>
 </html>
