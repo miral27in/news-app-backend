@@ -23,6 +23,8 @@ export interface TopicResult {
 	invalid: number;
 	removed: number;
 	error?: string;
+	/** error_code of any web_search calls that failed during this topic's search (diagnostics). */
+	search_errors?: string[];
 }
 
 export interface AgentResult {
@@ -40,27 +42,29 @@ export async function runAgent(env: Env, onlyTopic?: string): Promise<AgentResul
 	const startedAt = new Date().toISOString();
 	const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 
-	// Topics are independent, so search them concurrently; one failing topic doesn't sink the run.
+	// One topic at a time: three simultaneous web-search conversations were intermittently cut short
+	// (topics returning 1 article or none), while a lone topic reliably returned all 5. A failing topic
+	// doesn't sink the run.
 	const selected = onlyTopic ? TOPICS.filter((t) => t.id === onlyTopic) : TOPICS;
-	const topics = await Promise.all(
-		selected.map(async (topic): Promise<TopicResult> => {
-			try {
-				const candidates = await findArticlesWithRetry(client, topic);
-				return await storeArticles(env.DB, topic.id, candidates);
-			} catch (err) {
-				console.error(`agent: topic ${topic.id} failed`, err);
-				return {
-					topic: topic.id,
-					returned: 0,
-					inserted: 0,
-					skipped: 0,
-					invalid: 0,
-					removed: 0,
-					error: err instanceof Error ? err.message : String(err),
-				};
-			}
-		}),
-	);
+	const topics: TopicResult[] = [];
+	for (const topic of selected) {
+		try {
+			const candidates = await findArticlesWithRetry(client, topic);
+			const stored = await storeArticles(env.DB, topic.id, candidates);
+			topics.push(candidates.searchErrors.length ? { ...stored, search_errors: candidates.searchErrors } : stored);
+		} catch (err) {
+			console.error(`agent: topic ${topic.id} failed`, err);
+			topics.push({
+				topic: topic.id,
+				returned: 0,
+				inserted: 0,
+				skipped: 0,
+				invalid: 0,
+				removed: 0,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
 
 	const sum = (key: "returned" | "inserted" | "skipped" | "invalid" | "removed") =>
 		topics.reduce((n, t) => n + t[key], 0);
@@ -88,7 +92,13 @@ async function findArticlesWithRetry(client: Anthropic, topic: Topic) {
 	}
 }
 
-async function findArticles(client: Anthropic, topic: Topic): Promise<{ raw: unknown[]; valid: CandidateArticle[] }> {
+interface FoundArticles {
+	raw: unknown[];
+	valid: CandidateArticle[];
+	searchErrors: string[];
+}
+
+async function findArticles(client: Anthropic, topic: Topic): Promise<FoundArticles> {
 	const today = new Date().toISOString().slice(0, 10);
 	const prompt = `Today is ${today}. Use web search to find the ${ARTICLES_PER_RUN} most recent and significant news articles about ${topic.name} (${topic.searchHint}) published in the past 7 days.
 
@@ -106,6 +116,7 @@ Respond with only a JSON array of ${ARTICLES_PER_RUN} objects, no prose and no c
 	let response: Anthropic.Beta.BetaMessage | undefined;
 	const textParts: string[] = [];
 	const searchErrors: string[] = [];
+	const trace: string[] = []; // what the server tools did, attached to errors for diagnosis
 
 	for (let i = 0; i <= MAX_CONTINUATIONS; i++) {
 		response = await client.beta.messages.create({
@@ -114,16 +125,24 @@ Respond with only a JSON array of ${ARTICLES_PER_RUN} objects, no prose and no c
 			betas: ["server-side-fallback-2026-07-01"],
 			fallbacks: "default",
 			output_config: { effort: "medium" },
-			tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 6 }],
+			// Basic variant on purpose: web_search_20260209 lets Claude run batches of searches from a code step,
+			// which blew through max_uses after the first query and left topics (mostly weather) with 0-1 articles.
+			tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 6 }],
 			messages,
 		});
 
 		// Web search splits the answer into many text blocks (one per citation span); keep them all.
 		for (const block of response.content) {
 			if (block.type === "text") textParts.push(block.text);
-			// A failed search comes back as a 200 with an error object (not a list of results) in its result block.
-			if (block.type === "web_search_tool_result" && !Array.isArray(block.content)) {
-				searchErrors.push(block.content.error_code);
+			// A failed server-tool call comes back as a 200 with an error object in its *_tool_result block
+			// (web search, or the code execution that dynamic filtering runs under the hood).
+			if (block.type.endsWith("_tool_result")) {
+				const content = (block as { content?: unknown }).content;
+				const code = (content as { error_code?: unknown } | null)?.error_code;
+				if (typeof code === "string") searchErrors.push(`${block.type}:${code}`);
+				trace.push(`${block.type}=${Array.isArray(content) ? `list(${content.length})` : JSON.stringify(content)?.slice(0, 150)}`);
+			} else if (block.type === "server_tool_use") {
+				trace.push(`${(block as { name?: string }).name}(${JSON.stringify((block as { input?: unknown }).input)?.slice(0, 100)})`);
 			}
 		}
 
@@ -145,11 +164,13 @@ Respond with only a JSON array of ${ARTICLES_PER_RUN} objects, no prose and no c
 		raw = extractJsonArray(textParts.join(""));
 	} catch (err) {
 		// Keep the message prefix ("No JSON array") that findArticlesWithRetry matches on; add the real cause.
-		if (err instanceof Error && searchErrors.length) err.message += ` [web_search errors: ${searchErrors.join(", ")}]`;
+		if (err instanceof Error) {
+			err.message = err.message.slice(0, 250) + ` [tool trace: ${trace.join(" | ").slice(0, 900) || "no tool calls"}; stop_reason=${response?.stop_reason}]`;
+		}
 		throw err;
 	}
 	const valid = raw.map(normalizeArticle).filter((a): a is CandidateArticle => a !== null);
-	return { raw, valid };
+	return { raw, valid, searchErrors };
 }
 
 /** Pulls the JSON array out of Claude's concatenated text, tolerating stray prose or code fences. */
@@ -195,7 +216,7 @@ function normalizeDate(value: string): string | null {
 async function storeArticles(
 	db: D1Database,
 	topicId: string,
-	{ raw, valid }: { raw: unknown[]; valid: CandidateArticle[] },
+	{ raw, valid }: FoundArticles,
 ): Promise<TopicResult> {
 	const insert = db.prepare(
 		`INSERT INTO articles (topic, headline, source, published_at, url, summary, relevance_score)
