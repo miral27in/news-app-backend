@@ -47,6 +47,34 @@
 						</div>
 					</div>
 
+					<details class="hood">
+						<summary>Under the Hood</summary>
+						<div class="hood-body">
+							<label class="switch" for="hood-web">
+								<input type="checkbox" id="hood-web" role="switch">
+								<span class="switch-track" aria-hidden="true"></span>
+								<span class="switch-text">
+									<strong>Web search</strong>
+									<small>When on, Claude can search the web for information that isn't in the stored articles. Answers take longer and use more tokens.</small>
+								</span>
+							</label>
+
+							<div class="hood-stats" aria-live="polite">
+								<h3>Last response</h3>
+								<p id="hood-empty" class="hood-empty">Send a question to see what went into the answer.</p>
+								<dl id="hood-grid" class="hood-grid" hidden>
+									<div><dt>Articles from database</dt><dd id="hood-articles">0</dd></div>
+									<div><dt>Context tokens (≈, articles only)</dt><dd id="hood-context">0</dd></div>
+									<div><dt>Input tokens</dt><dd id="hood-input">0</dd></div>
+									<div><dt>Output tokens</dt><dd id="hood-output">0</dd></div>
+									<div><dt>Web searches</dt><dd id="hood-searches">0</dd></div>
+									<div><dt>Model</dt><dd id="hood-model" class="hood-model">-</dd></div>
+								</dl>
+								<p class="hood-foot">Input and output tokens are exact counts from the API. Input also covers the system prompt, your question and any web results. Context tokens are an estimate (about 4 characters per token) of the retrieved articles only.</p>
+							</div>
+						</div>
+					</details>
+
 					<div id="chat-log" class="chat-log" role="log" aria-live="polite" aria-label="Conversation" tabindex="0">
 						<p class="chat-empty">Ask about the latest NFL, stock market or weather news. Answers come from the articles below.</p>
 					</div>

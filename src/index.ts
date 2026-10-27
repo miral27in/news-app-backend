@@ -10,7 +10,7 @@
  */
 import { runAgent } from "./agent";
 import { BadRequestError, listArticles } from "./articles";
-import { handleChat } from "./chat";
+import { handleChat } from "./chat-handler";
 import { CORS_HEADERS, json, methodNotAllowed, requirePassword } from "./http";
 import { TOPICS } from "./topics";
 

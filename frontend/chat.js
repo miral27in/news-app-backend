@@ -14,9 +14,22 @@
 		input: $("chat-input"),
 		send: $("chat-send"),
 		sendLabel: $("chat-send-label"),
+		web: $("hood-web"),
+		hoodEmpty: $("hood-empty"),
+		hoodGrid: $("hood-grid"),
+		hood: {
+			articles: $("hood-articles"),
+			context: $("hood-context"),
+			input: $("hood-input"),
+			output: $("hood-output"),
+			searches: $("hood-searches"),
+			model: $("hood-model"),
+		},
 	};
 
 	els.system.value = DEFAULT_SYSTEM;
+
+	const num = (v) => Number(v ?? 0).toLocaleString();
 
 	function el(tag, className, text) {
 		const node = document.createElement(tag);
@@ -47,35 +60,89 @@
 		}
 	}
 
-	function renderSources(msg, sources) {
-		if (!sources?.length) return;
-		const details = el("details", "chat-sources");
-		details.append(el("summary", "", `Sources (${sources.length})`));
+	function linkTo(url, label) {
+		const href = safeUrl(url);
+		if (!href) return document.createTextNode(label);
+		const a = el("a", "", label);
+		a.href = href;
+		a.target = "_blank";
+		a.rel = "noopener noreferrer";
+		return a;
+	}
+
+	function sourceGroup(title, items) {
+		const group = el("div", "chat-source-group");
+		group.append(el("div", "chat-source-title", title));
 		const list = el("ul");
-		for (const s of sources) {
-			const item = el("li");
-			item.append(el("span", "chat-source-id", `[${s.id}]`), " ");
-			const href = safeUrl(s.url);
-			if (href) {
-				const a = el("a", "", s.headline);
-				a.href = href;
-				a.target = "_blank";
-				a.rel = "noopener noreferrer";
-				item.append(a);
-			} else {
-				item.append(s.headline);
-			}
-			item.append(el("span", "chat-source-meta", ` ${s.source}`));
-			list.append(item);
+		for (const item of items) list.append(item);
+		group.append(list);
+		return group;
+	}
+
+	// Database articles and web pages are listed separately so a reader can tell where each fact came from.
+	function renderSources(msg, dbSources, webSources) {
+		if (!dbSources?.length && !webSources?.length) return;
+		const details = el("details", "chat-sources");
+		const parts = [];
+		if (dbSources?.length) parts.push(`${dbSources.length} from database`);
+		if (webSources?.length) parts.push(`${webSources.length} from the web`);
+		details.append(el("summary", "", `Sources (${parts.join(", ")})`));
+
+		if (dbSources?.length) {
+			details.append(
+				sourceGroup(
+					"Stored articles",
+					dbSources.map((s) => {
+						const li = el("li");
+						li.append(el("span", "chat-source-id", `[${s.id}]`), " ", linkTo(s.url, s.headline), el("span", "chat-source-meta", ` ${s.source}`));
+						return li;
+					}),
+				),
+			);
 		}
-		details.append(list);
+		if (webSources?.length) {
+			details.append(
+				sourceGroup(
+					"Web",
+					webSources.map((s) => {
+						const li = el("li");
+						li.append(linkTo(s.url, s.title));
+						return li;
+					}),
+				),
+			);
+		}
 		msg.append(details);
 	}
 
-	function renderUsage(msg, data) {
-		const n = (v) => Number(v).toLocaleString();
-		const u = data.usage || {};
-		msg.append(el("div", "chat-usage", `Tokens: ${n(u.input_tokens ?? 0)} in · ${n(u.output_tokens ?? 0)} out · ${data.model}`));
+	// Always-visible stats line under each answer (the Under the Hood panel shows the same numbers larger).
+	function renderStats(msg, data) {
+		const web = data.web_search || {};
+		const usage = data.usage || {};
+		const line = el("div", "chat-usage");
+		const add = (label, value) => {
+			const item = el("span", "chat-usage-item");
+			item.append(`${label} `, el("strong", "", value));
+			line.append(item);
+		};
+		add("Database:", `${num(data.articles_used)} article${data.articles_used === 1 ? "" : "s"} (≈${num(data.context_tokens_estimate)} context tokens)`);
+		add("Web search:", web.enabled ? `${num(web.searches)} search${web.searches === 1 ? "" : "es"}` : "off");
+		add("Tokens:", `${num(usage.input_tokens)} in · ${num(usage.output_tokens)} out`);
+		line.append(el("span", "chat-usage-item chat-usage-model", data.model));
+		msg.append(line);
+	}
+
+	function updateHood(data) {
+		const web = data.web_search || {};
+		const usage = data.usage || {};
+		els.hood.articles.textContent = num(data.articles_used);
+		els.hood.context.textContent = `≈${num(data.context_tokens_estimate)}`;
+		els.hood.input.textContent = num(usage.input_tokens);
+		els.hood.output.textContent = num(usage.output_tokens);
+		els.hood.searches.textContent = web.enabled ? num(web.searches) : "off";
+		els.hood.model.textContent = data.model;
+		els.hoodEmpty.hidden = true;
+		els.hoodGrid.hidden = false;
 	}
 
 	function setBusy(on) {
@@ -101,18 +168,28 @@
 	}
 
 	async function ask(question) {
+		// Read the toggle once, so the label, the request and the result all agree even if it's flipped mid-request.
+		const webSearch = els.web.checked;
 		addMessage("user", question);
-		const pending = addMessage("assistant pending", "Looking through the latest articles…");
+		const pending = addMessage(
+			"assistant pending",
+			webSearch ? "Checking the latest articles and searching the web…" : "Looking through the latest articles…",
+		);
 		setBusy(true);
 
 		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 90_000);
+		const timer = setTimeout(() => controller.abort(), 120_000);
 		try {
 			const res = await fetch("/api/chat", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				signal: controller.signal,
-				body: JSON.stringify({ question, system: els.system.value.trim() || undefined, model: els.model.value }),
+				body: JSON.stringify({
+					question,
+					system: els.system.value.trim() || undefined,
+					model: els.model.value,
+					web_search: webSearch,
+				}),
 			});
 			const data = await res.json().catch(() => ({}));
 
@@ -123,8 +200,9 @@
 			} else {
 				pending.querySelector(".chat-text").textContent = data.answer || "(The model returned an empty answer.)";
 				if (data.truncated) pending.append(el("div", "chat-usage", "The answer was cut off at the length limit."));
-				renderSources(pending, data.sources);
-				renderUsage(pending, data);
+				renderSources(pending, data.sources, data.web_search?.sources);
+				renderStats(pending, data);
+				updateHood(data);
 			}
 		} catch (err) {
 			pending.className = "chat-msg error";

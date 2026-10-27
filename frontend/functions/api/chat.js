@@ -33,6 +33,8 @@ export async function onRequestPost({ request, env }) {
 		question: input.question,
 		system: input.system,
 		model: ALLOWED_MODELS.includes(input.model) ? input.model : FAST_MODEL,
+		// Only a literal true turns web search on (it costs more per question).
+		web_search: input.web_search === true,
 	};
 
 	const upstream = await fetch(`${WORKER_URL}/chat`, {

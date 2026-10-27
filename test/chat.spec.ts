@@ -23,7 +23,7 @@ function article(id: number, over: Partial<ArticleRow>): ArticleRow {
 describe("parseChatRequest", () => {
 	it("accepts a minimal request and applies defaults", () => {
 		const req = parseChatRequest(JSON.stringify({ question: "  What happened?  " }));
-		expect(req).toEqual({ question: "What happened?", system: undefined, model: "claude-opus-5-5", maxArticles: 8, dryRun: false });
+		expect(req).toEqual({ question: "What happened?", system: undefined, model: "claude-opus-5-5", maxArticles: 8, dryRun: false, webSearch: false });
 	});
 
 	it("accepts dry_run and rejects a non-boolean one", () => {
